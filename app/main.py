@@ -1,45 +1,53 @@
 # app/main.py
+"""
+GDAL Microservice - A simple HTTP wrapper for GDAL command-line tools
+Allows cloud services to execute GDAL commands via REST API
+"""
+
 import os
 import asyncio
-import subprocess
 import shutil
 import json
-import csv
+import uuid
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, List, Any
 from enum import Enum
-import uuid
-import zipfile
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Body
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from google.cloud import storage
 from contextlib import asynccontextmanager
 import aiofiles
-from osgeo import ogr, osr, gdal
-
-# Enable GDAL exceptions
-gdal.UseExceptions()
 
 # Configuration
 WORKSPACE_DIR = Path("/tmp/gdal-workspace")
 UPLOAD_DIR = Path("/tmp/gdal-uploads")
 OUTPUT_DIR = Path("/tmp/gdal-outputs")
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 524288000))  # 500MB default
-GCS_BUCKET = os.getenv("GCS_BUCKET", "")
+COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", 3600))  # 1 hour default
 
 # Ensure directories exist
 for dir_path in [WORKSPACE_DIR, UPLOAD_DIR, OUTPUT_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
-# Initialize GCS client
-try:
-    gcs_client = storage.Client()
-except Exception as e:
-    print(f"Warning: Could not create GCS client: {e}")
-    gcs_client = None
+# Allowed GDAL commands
+ALLOWED_COMMANDS = {
+    "ogr2ogr": "Vector data conversion and processing",
+    "ogrinfo": "Vector data information",
+    "gdal_translate": "Raster data conversion",
+    "gdalinfo": "Raster data information",
+    "gdalwarp": "Raster reprojection and warping",
+    "gdal_rasterize": "Vector to raster conversion",
+    "gdal_polygonize": "Raster to vector conversion",
+    "gdal_contour": "Contour generation from raster",
+    "gdaldem": "DEM processing (hillshade, slope, etc.)",
+    "gdalbuildvrt": "Build virtual raster",
+    "ogrmerge": "Merge vector files",
+    "gdal_merge": "Merge raster files"
+}
 
 
 class JobStatus(str, Enum):
@@ -49,87 +57,97 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
-class ConversionRequest(BaseModel):
-    input_url: str = Field(..., description="GCS URL of input file")
-    output_format: str = Field(..., description="Target output format")
-    output_bucket: Optional[str] = Field(None, description="GCS bucket for output")
-    output_path: Optional[str] = Field(None, description="GCS path for output")
-    options: Optional[Dict[str, str]] = Field(default_factory=dict, description="GDAL conversion options")
+class GDALCommand(BaseModel):
+    """Model for GDAL command execution"""
+    command: str = Field(..., description="GDAL command (e.g., ogr2ogr, gdalwarp)")
+    args: List[str] = Field(..., description="Command arguments as you would use in CLI")
+    input_files: Optional[Dict[str, str]] = Field(None, description="Map of filename to download URL (optional)")
+    output_filename: Optional[str] = Field(None, description="Expected output filename")
 
 
-class ReprojectionRequest(BaseModel):
-    input_url: str = Field(..., description="GCS URL of input file")
-    target_srs: str = Field(..., description="Target spatial reference system (EPSG code or PROJ string)")
-    output_format: Optional[str] = Field(None, description="Output format (defaults to input format)")
-    output_bucket: Optional[str] = Field(None, description="GCS bucket for output")
-    output_path: Optional[str] = Field(None, description="GCS path for output")
-
-
-class ClipRequest(BaseModel):
-    input_url: str = Field(..., description="GCS URL of input file")
-    clip_bounds: Optional[List[float]] = Field(None, description="Bounding box [xmin, ymin, xmax, ymax]")
-    clip_geometry_url: Optional[str] = Field(None, description="GCS URL of clip geometry file")
-    output_format: Optional[str] = Field(None, description="Output format")
-    output_bucket: Optional[str] = Field(None, description="GCS bucket for output")
-    output_path: Optional[str] = Field(None, description="GCS path for output")
-
-
-class Job(BaseModel):
+class CommandJob(BaseModel):
+    """Job tracking for async command execution"""
     id: str
     status: JobStatus
-    input_format: Optional[str] = None
-    output_format: Optional[str] = None
-    input_source: str
-    input_path: str
-    output_path: Optional[str] = None
+    command: str
+    args: List[str]
+    output_file: Optional[str] = None
     error: Optional[str] = None
+    stdout: Optional[str] = None
+    stderr: Optional[str] = None
     created_at: datetime
     completed_at: Optional[datetime] = None
-    options: Optional[Dict[str, str]] = None
+    execution_time_seconds: Optional[float] = None
 
 
-class FormatInfo(BaseModel):
-    name: str
-    driver: str
-    extensions: List[str]
-    capabilities: List[str]
-
-
-# In-memory job storage (replace with Redis/database in production)
-jobs_store: Dict[str, Job] = {}
+# In-memory job storage (use Redis in production)
+jobs_store: Dict[str, CommandJob] = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Cleanup old files on startup and shutdown"""
     # Startup
-    print(f"GDAL version: {gdal.VersionInfo()}")
-    print(f"Available drivers: {gdal.GetDriverCount()}")
+    print(f"GDAL Microservice starting...")
+    print(f"Available commands: {', '.join(ALLOWED_COMMANDS.keys())}")
+    
+    # Clean old files
+    cleanup_old_files()
+    
     yield
+    
     # Shutdown
     print("Shutting down...")
+    cleanup_old_files()
 
 
 app = FastAPI(
-    title="GDAL API Service",
-    description="Serverless GDAL processing API for vector data",
-    version="1.0.0",
+    title="GDAL Microservice",
+    description="HTTP wrapper for GDAL command-line tools",
+    version="2.0.0",
     lifespan=lifespan
 )
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+async def root():
+    """Root endpoint with service info"""
+    return {
+        "service": "GDAL Microservice",
+        "version": "2.0.0",
+        "description": "Execute GDAL commands via HTTP",
+        "endpoints": {
+            "/health": "Health check",
+            "/commands": "List available commands",
+            "/execute": "Execute GDAL command synchronously",
+            "/execute-async": "Execute GDAL command asynchronously",
+            "/upload-and-execute": "Upload file and execute command",
+            "/jobs/{job_id}": "Get job status",
+            "/jobs/{job_id}/download": "Download job result"
+        }
+    }
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     try:
-        # Check GDAL availability
-        gdal_version = gdal.VersionInfo()
-        driver_count = gdal.GetDriverCount()
+        # Check if GDAL is available
+        result = await run_command(["gdalinfo", "--version"])
         
         return {
             "status": "healthy",
-            "gdal_available": True,
-            "gdal_version": gdal_version,
-            "driver_count": driver_count,
+            "gdal_available": result["success"],
+            "gdal_version": result.get("stdout", "").strip(),
             "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
@@ -143,198 +161,231 @@ async def health_check():
         )
 
 
-@app.get("/api/v1/formats", response_model=List[FormatInfo])
-async def get_formats():
-    """Get list of supported vector formats"""
-    formats = [
-        FormatInfo(
-            name="ESRI Shapefile",
-            driver="ESRI Shapefile",
-            extensions=[".shp", ".dbf", ".shx", ".prj"],
-            capabilities=["read", "write"]
-        ),
-        FormatInfo(
-            name="GeoPackage",
-            driver="GPKG",
-            extensions=[".gpkg"],
-            capabilities=["read", "write", "update"]
-        ),
-        FormatInfo(
-            name="GeoJSON",
-            driver="GeoJSON",
-            extensions=[".geojson", ".json"],
-            capabilities=["read", "write"]
-        ),
-        FormatInfo(
-            name="CSV",
-            driver="CSV",
-            extensions=[".csv"],
-            capabilities=["read", "write"]
-        ),
-        FormatInfo(
-            name="File Geodatabase",
-            driver="OpenFileGDB",
-            extensions=[".gdb"],
-            capabilities=["read"]
-        ),
-        FormatInfo(
-            name="KML",
-            driver="KML",
-            extensions=[".kml", ".kmz"],
-            capabilities=["read", "write"]
-        ),
-        FormatInfo(
-            name="FlatGeobuf",
-            driver="FlatGeobuf",
-            extensions=[".fgb"],
-            capabilities=["read", "write"]
-        ),
-        FormatInfo(
-            name="Parquet",
-            driver="Parquet",
-            extensions=[".parquet"],
-            capabilities=["read", "write"]
-        ),
-        FormatInfo(
-            name="GML",
-            driver="GML",
-            extensions=[".gml"],
-            capabilities=["read", "write"]
-        ),
-        FormatInfo(
-            name="MapInfo File",
-            driver="MapInfo File",
-            extensions=[".tab", ".mif", ".mid"],
-            capabilities=["read", "write"]
-        )
-    ]
+@app.get("/commands")
+async def list_commands():
+    """List available GDAL commands"""
+    return {
+        "commands": [
+            {
+                "command": cmd,
+                "description": desc,
+                "example": get_command_example(cmd)
+            }
+            for cmd, desc in ALLOWED_COMMANDS.items()
+        ]
+    }
+
+
+@app.post("/execute")
+async def execute_command(request: GDALCommand):
+    """
+    Execute a GDAL command synchronously and return the result.
     
-    return formats
+    Example request:
+    {
+        "command": "ogr2ogr",
+        "args": ["-f", "GeoJSON", "output.json", "input.shp"]
+    }
+    """
+    # Validate command
+    if request.command not in ALLOWED_COMMANDS:
+        raise HTTPException(400, f"Command '{request.command}' not allowed. Use one of: {list(ALLOWED_COMMANDS.keys())}")
+    
+    # Create workspace for this execution
+    work_id = str(uuid.uuid4())
+    work_dir = WORKSPACE_DIR / work_id
+    work_dir.mkdir(exist_ok=True)
+    
+    try:
+        # Prepare file paths
+        prepared_args = prepare_arguments(request.args, work_dir)
+        
+        # Build full command
+        cmd = [request.command] + prepared_args
+        
+        # Execute command
+        result = await run_command(cmd, cwd=work_dir)
+        
+        # Check for output file
+        output_file = None
+        if request.output_filename:
+            output_path = work_dir / request.output_filename
+            if output_path.exists():
+                # Move to output directory
+                final_path = OUTPUT_DIR / f"{work_id}_{request.output_filename}"
+                shutil.move(str(output_path), str(final_path))
+                output_file = str(final_path)
+        
+        return {
+            "success": result["success"],
+            "command": request.command,
+            "args": request.args,
+            "stdout": result.get("stdout"),
+            "stderr": result.get("stderr"),
+            "output_file": output_file,
+            "download_url": f"/download/{work_id}/{request.output_filename}" if output_file else None
+        }
+        
+    finally:
+        # Clean up workspace
+        if work_dir.exists():
+            shutil.rmtree(work_dir)
 
 
-@app.post("/api/v1/convert", status_code=202)
-async def convert_from_url(
-    request: ConversionRequest,
+@app.post("/execute-async", status_code=202)
+async def execute_command_async(
+    request: GDALCommand,
     background_tasks: BackgroundTasks
 ):
-    """Convert geospatial data from a GCS URL"""
-    job_id = str(uuid.uuid4())
+    """
+    Execute a GDAL command asynchronously.
+    Returns a job ID for tracking.
+    """
+    # Validate command
+    if request.command not in ALLOWED_COMMANDS:
+        raise HTTPException(400, f"Command '{request.command}' not allowed")
     
-    job = Job(
+    # Create job
+    job_id = str(uuid.uuid4())
+    job = CommandJob(
         id=job_id,
         status=JobStatus.PENDING,
-        output_format=request.output_format,
-        input_source="gcs",
-        input_path=request.input_url,
-        created_at=datetime.utcnow(),
-        options=request.options
+        command=request.command,
+        args=request.args,
+        created_at=datetime.utcnow()
     )
-    
-    if request.output_bucket and request.output_path:
-        job.output_path = f"gs://{request.output_bucket}/{request.output_path}"
     
     jobs_store[job_id] = job
     
-    # Process in background
-    background_tasks.add_task(process_conversion, job_id)
+    # Execute in background
+    background_tasks.add_task(
+        process_command_async,
+        job_id,
+        request
+    )
     
-    return job
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "status_url": f"/jobs/{job_id}",
+        "message": "Command execution started"
+    }
 
 
-@app.post("/api/v1/convert/upload", status_code=202)
-async def convert_upload(
-    background_tasks: BackgroundTasks,
+@app.post("/upload-and-execute")
+async def upload_and_execute(
     file: UploadFile = File(...),
-    output_format: str = Form(...),
-    input_srid: Optional[str] = Form(None, description="Input SRID/EPSG code (e.g., 4326, 3857, 26912)"),
-    output_srid: Optional[str] = Form(None, description="Output SRID/EPSG code for reprojection"),
-    output_bucket: Optional[str] = Form(None),
-    output_path: Optional[str] = Form(None),
-    options: Optional[str] = Form(None)
+    command: str = Form(...),
+    args: str = Form(..., description="JSON array of arguments"),
+    output_filename: Optional[str] = Form(None)
 ):
-    """Upload and convert a geospatial file with optional SRID specification"""
+    """
+    Upload a file and execute a GDAL command on it.
+    
+    Args should be a JSON array where {input} will be replaced with the uploaded filename.
+    Example: ["-f", "GeoJSON", "output.json", "{input}"]
+    """
     # Validate file size
     if file.size and file.size > MAX_FILE_SIZE:
         raise HTTPException(400, f"File size exceeds maximum of {MAX_FILE_SIZE} bytes")
     
-    # Parse options if provided
-    conversion_options = {}
-    if options:
-        try:
-            conversion_options = json.loads(options)
-        except json.JSONDecodeError:
-            raise HTTPException(400, "Invalid JSON in options parameter")
+    # Parse arguments
+    try:
+        args_list = json.loads(args)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON in args parameter")
     
-    # Add SRID options if provided
-    if input_srid:
-        # Normalize SRID format (accept both "4326" and "EPSG:4326")
-        if not input_srid.upper().startswith("EPSG:"):
-            input_srid = f"EPSG:{input_srid}"
-        conversion_options["s_srs"] = input_srid
-        print(f"DEBUG: Input SRID set to {input_srid}")
+    # Validate command
+    if command not in ALLOWED_COMMANDS:
+        raise HTTPException(400, f"Command '{command}' not allowed")
     
-    if output_srid:
-        # Normalize output SRID format
-        if not output_srid.upper().startswith("EPSG:"):
-            output_srid = f"EPSG:{output_srid}"
-        conversion_options["t_srs"] = output_srid
-        print(f"DEBUG: Output SRID set to {output_srid}")
+    # Create workspace
+    work_id = str(uuid.uuid4())
+    work_dir = WORKSPACE_DIR / work_id
+    work_dir.mkdir(exist_ok=True)
     
-    # Save uploaded file
-    upload_id = str(uuid.uuid4())
-    upload_path = UPLOAD_DIR / f"{upload_id}_{file.filename}"
-    
-    async with aiofiles.open(upload_path, 'wb') as f:
-        content = await file.read()
-        await f.write(content)
-    
-    # Create job
-    job_id = str(uuid.uuid4())
-    job = Job(
-        id=job_id,
-        status=JobStatus.PENDING,
-        output_format=output_format,
-        input_source="upload",
-        input_path=str(upload_path),
-        created_at=datetime.utcnow(),
-        options=conversion_options
-    )
-    
-    if output_bucket and output_path:
-        job.output_path = f"gs://{output_bucket}/{output_path}"
-    
-    jobs_store[job_id] = job
-    
-    # Process in background
-    background_tasks.add_task(process_conversion, job_id)
-    
-    return job
+    try:
+        # Save uploaded file
+        input_path = work_dir / file.filename
+        async with aiofiles.open(input_path, 'wb') as f:
+            content = await file.read()
+            await f.write(content)
+        
+        # Replace {input} placeholder in args
+        prepared_args = [
+            str(input_path) if arg == "{input}" else arg
+            for arg in args_list
+        ]
+        
+        # Build and execute command
+        cmd = [command] + prepared_args
+        result = await run_command(cmd, cwd=work_dir)
+        
+        # Check for output file
+        output_file = None
+        download_url = None
+        
+        if output_filename:
+            output_path = work_dir / output_filename
+            if output_path.exists():
+                # Move to output directory
+                final_path = OUTPUT_DIR / f"{work_id}_{output_filename}"
+                shutil.move(str(output_path), str(final_path))
+                output_file = str(final_path)
+                download_url = f"/download/{work_id}/{output_filename}"
+        else:
+            # Try to find any output file
+            for item in work_dir.iterdir():
+                if item.is_file() and item.name != file.filename:
+                    final_path = OUTPUT_DIR / f"{work_id}_{item.name}"
+                    shutil.move(str(item), str(final_path))
+                    output_file = str(final_path)
+                    download_url = f"/download/{work_id}/{item.name}"
+                    break
+        
+        return {
+            "success": result["success"],
+            "command": command,
+            "args": prepared_args,
+            "stdout": result.get("stdout"),
+            "stderr": result.get("stderr"),
+            "output_file": output_file,
+            "download_url": download_url
+        }
+        
+    finally:
+        # Clean up workspace
+        if work_dir.exists():
+            shutil.rmtree(work_dir)
 
 
-@app.get("/api/v1/jobs/{job_id}", response_model=Job)
-async def get_job(job_id: str):
-    """Get job status"""
+@app.get("/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    """Get job status and results"""
     if job_id not in jobs_store:
         raise HTTPException(404, "Job not found")
     
-    return jobs_store[job_id]
-
-
-@app.get("/api/v1/jobs", response_model=Dict[str, Any])
-async def list_jobs():
-    """List all jobs"""
+    job = jobs_store[job_id]
     return {
-        "jobs": list(jobs_store.values()),
-        "count": len(jobs_store)
+        "id": job.id,
+        "status": job.status,
+        "command": job.command,
+        "args": job.args,
+        "created_at": job.created_at.isoformat(),
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "execution_time_seconds": job.execution_time_seconds,
+        "output_file": job.output_file,
+        "download_url": f"/jobs/{job_id}/download" if job.output_file else None,
+        "error": job.error,
+        "stdout": job.stdout,
+        "stderr": job.stderr
     }
 
 
-@app.get("/api/v1/jobs/{job_id}/download")
-async def download_result(job_id: str):
-    """Download conversion result"""
-    # Check if job exists
+@app.get("/jobs/{job_id}/download")
+async def download_job_result(job_id: str):
+    """Download the output file from a completed job"""
     if job_id not in jobs_store:
-        print(f"DEBUG: Job {job_id} not found. Available jobs: {list(jobs_store.keys())}")
         raise HTTPException(404, "Job not found")
     
     job = jobs_store[job_id]
@@ -342,545 +393,180 @@ async def download_result(job_id: str):
     if job.status != JobStatus.COMPLETED:
         raise HTTPException(400, f"Job status is {job.status}, not completed")
     
-    # For GCS files, redirect
-    if job.output_path and job.output_path.startswith("gs://"):
-        raise HTTPException(
-            303,
-            "File stored in GCS, use the output_path",
-            headers={"Location": job.output_path}
-        )
+    if not job.output_file or not Path(job.output_file).exists():
+        raise HTTPException(404, "Output file not found")
     
-    # For local files, construct the path
-    if job.output_path:
-        output_file = Path(job.output_path)
-        
-        # If file doesn't exist at stored path, try standard locations
-        if not output_file.exists():
-            # Try with different extensions based on format
-            possible_paths = [
-                OUTPUT_DIR / f"{job_id}_shapefile.zip",  # Zipped shapefile
-                OUTPUT_DIR / f"{job_id}_output.parquet",
-                OUTPUT_DIR / f"{job_id}_output.gpkg",
-                OUTPUT_DIR / f"{job_id}_output.shp",
-                OUTPUT_DIR / f"{job_id}_output.geojson",
-                OUTPUT_DIR / f"{job_id}_output.fgb",
-                OUTPUT_DIR / f"{job_id}_output",
-                Path(job.output_path)
-            ]
-            
-            for path in possible_paths:
-                if path.exists():
-                    output_file = path
-                    break
-        
-        print(f"DEBUG: Trying to serve file: {output_file}")
-        print(f"DEBUG: File exists: {output_file.exists()}")
-        if output_file.exists():
-            print(f"DEBUG: File size: {output_file.stat().st_size} bytes")
-        
-        if output_file.exists():
-            # Determine appropriate filename for download
-            if job.output_format.lower() in ['shapefile', 'shp'] and output_file.suffix == '.zip':
-                download_filename = f"{job_id}_shapefile.zip"
-                media_type = "application/zip"
-            else:
-                download_filename = output_file.name
-                media_type = "application/octet-stream"
-            
-            return FileResponse(
-                path=str(output_file),
-                media_type=media_type,
-                filename=download_filename,
-                headers={
-                    "Content-Disposition": f"attachment; filename={download_filename}"
-                }
-            )
-    
-    # If we get here, file not found
-    raise HTTPException(404, f"Output file not found. Expected at: {job.output_path}")
-
-
-@app.post("/api/v1/operations/reproject", status_code=202)
-async def reproject(
-    request: ReprojectionRequest,
-    background_tasks: BackgroundTasks
-):
-    """Reproject a dataset to a different coordinate system"""
-    job_id = str(uuid.uuid4())
-    
-    options = {
-        "t_srs": request.target_srs
-    }
-    
-    job = Job(
-        id=job_id,
-        status=JobStatus.PENDING,
-        output_format=request.output_format,
-        input_source="gcs",
-        input_path=request.input_url,
-        created_at=datetime.utcnow(),
-        options=options
+    return FileResponse(
+        path=job.output_file,
+        filename=Path(job.output_file).name,
+        media_type="application/octet-stream"
     )
-    
-    if request.output_bucket and request.output_path:
-        job.output_path = f"gs://{request.output_bucket}/{request.output_path}"
-    
-    jobs_store[job_id] = job
-    
-    background_tasks.add_task(process_conversion, job_id)
-    
-    return job
 
 
-@app.post("/api/v1/operations/clip", status_code=202)
-async def clip(
-    request: ClipRequest,
-    background_tasks: BackgroundTasks
-):
-    """Clip a dataset using bounds or another geometry"""
-    job_id = str(uuid.uuid4())
+@app.get("/download/{work_id}/{filename}")
+async def download_file(work_id: str, filename: str):
+    """Direct download of output files"""
+    file_path = OUTPUT_DIR / f"{work_id}_{filename}"
     
-    options = {}
-    if request.clip_bounds:
-        options["clipsrc"] = " ".join(map(str, request.clip_bounds))
-    elif request.clip_geometry_url:
-        # Download clip geometry first
-        options["clipsrc"] = request.clip_geometry_url
-    else:
-        raise HTTPException(400, "Either clip_bounds or clip_geometry_url must be provided")
+    if not file_path.exists():
+        raise HTTPException(404, "File not found")
     
-    job = Job(
-        id=job_id,
-        status=JobStatus.PENDING,
-        output_format=request.output_format,
-        input_source="gcs",
-        input_path=request.input_url,
-        created_at=datetime.utcnow(),
-        options=options
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type="application/octet-stream"
     )
-    
-    if request.output_bucket and request.output_path:
-        job.output_path = f"gs://{request.output_bucket}/{request.output_path}"
-    
-    jobs_store[job_id] = job
-    
-    background_tasks.add_task(process_conversion, job_id)
-    
-    return job
 
 
-@app.post("/api/v1/info")
-async def get_file_info(file: UploadFile = File(...)):
-    """Get information about a geospatial file"""
-    # Save uploaded file temporarily
-    temp_path = WORKSPACE_DIR / f"info_{uuid.uuid4()}_{file.filename}"
-    
-    async with aiofiles.open(temp_path, 'wb') as f:
-        content = await file.read()
-        await f.write(content)
-    
+# Helper functions
+
+async def run_command(
+    cmd: List[str],
+    cwd: Optional[Path] = None,
+    timeout: int = COMMAND_TIMEOUT
+) -> Dict[str, Any]:
+    """Execute a command and return results"""
     try:
-        # Handle .gdb.zip files
-        if str(temp_path).endswith('.gdb.zip'):
-            extract_dir = WORKSPACE_DIR / f"extract_{uuid.uuid4()}"
-            extract_dir.mkdir(exist_ok=True)
-            
-            with zipfile.ZipFile(temp_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_dir)
-            
-            # Find the .gdb directory
-            for item in extract_dir.iterdir():
-                if item.suffix == '.gdb' and item.is_dir():
-                    temp_path = item
-                    break
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd
+        )
         
-        # Open with GDAL
-        dataset = ogr.Open(str(temp_path))
-        if not dataset:
-            raise HTTPException(400, "Could not open file with GDAL")
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            return {
+                "success": False,
+                "error": f"Command timed out after {timeout} seconds",
+                "stdout": "",
+                "stderr": ""
+            }
         
-        info = {
-            "driver": dataset.GetDriver().GetName(),
-            "layer_count": dataset.GetLayerCount(),
-            "layers": []
+        return {
+            "success": process.returncode == 0,
+            "returncode": process.returncode,
+            "stdout": stdout.decode('utf-8', errors='replace'),
+            "stderr": stderr.decode('utf-8', errors='replace')
         }
         
-        for i in range(dataset.GetLayerCount()):
-            layer = dataset.GetLayerByIndex(i)
-            layer_info = {
-                "name": layer.GetName(),
-                "feature_count": layer.GetFeatureCount(),
-                "geometry_type": ogr.GeometryTypeToName(layer.GetGeomType()),
-                "extent": layer.GetExtent() if layer.GetFeatureCount() > 0 else None,
-                "srs": None,
-                "fields": []
-            }
-            
-            # Get SRS info
-            srs = layer.GetSpatialRef()
-            if srs:
-                layer_info["srs"] = {
-                    "proj4": srs.ExportToProj4(),
-                    "epsg": srs.GetAttrValue("AUTHORITY", 1) if srs.GetAttrValue("AUTHORITY", 0) == "EPSG" else None,
-                    "wkt": srs.ExportToWkt()
-                }
-            
-            # Get field info
-            layer_defn = layer.GetLayerDefn()
-            for j in range(layer_defn.GetFieldCount()):
-                field = layer_defn.GetFieldDefn(j)
-                layer_info["fields"].append({
-                    "name": field.GetName(),
-                    "type": field.GetTypeName(),
-                    "width": field.GetWidth(),
-                    "precision": field.GetPrecision()
-                })
-            
-            info["layers"].append(layer_info)
-        
-        dataset = None  # Close dataset
-        return info
-        
-    finally:
-        # Clean up temp file
-        if temp_path.exists():
-            if temp_path.is_file():
-                temp_path.unlink()
-            elif temp_path.is_dir():
-                shutil.rmtree(temp_path.parent)  # Clean up extract directory
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "stdout": "",
+            "stderr": ""
+        }
 
 
-# Background processing functions
-
-async def process_conversion(job_id: str):
-    """Process a conversion job with multi-layer support"""
+async def process_command_async(job_id: str, request: GDALCommand):
+    """Process command asynchronously"""
     job = jobs_store[job_id]
+    start_time = datetime.utcnow()
     
     try:
         job.status = JobStatus.PROCESSING
-        print(f"DEBUG: Processing job {job_id}")
         
-        # Download input file if from GCS
-        input_file = job.input_path
-        if job.input_source == "gcs":
-            input_file = await download_from_gcs(job.input_path)
+        # Create workspace
+        work_dir = WORKSPACE_DIR / job_id
+        work_dir.mkdir(exist_ok=True)
         
-        # Handle .gdb files specially
-        if '.gdb' in str(input_file):
-            # Extract if zipped
-            if str(input_file).endswith('.zip'):
-                extract_dir = Path(input_file).parent / f"extract_{job_id}"
-                extract_dir.mkdir(exist_ok=True)
-                
-                print(f"DEBUG: Extracting {input_file} to {extract_dir}")
-                with zipfile.ZipFile(input_file, 'r') as zip_ref:
-                    zip_ref.extractall(extract_dir)
-                
-                # Find the .gdb
-                for item in extract_dir.iterdir():
-                    if item.suffix == '.gdb':
-                        input_file = str(item)
-                        print(f"DEBUG: Found .gdb at {input_file}")
-                        break
+        # Prepare arguments
+        prepared_args = prepare_arguments(request.args, work_dir)
         
-        # Handle CSV files specially - create VRT for better geometry handling
-        if str(input_file).lower().endswith('.csv'):
-            print(f"DEBUG: Detected CSV input, creating VRT for geometry handling")
-            
-            # Get SRID from options or use default
-            input_srid = "EPSG:4326"  # Default to WGS84
-            if job.options and "s_srs" in job.options:
-                input_srid = job.options["s_srs"]
-                print(f"DEBUG: Using specified input SRID: {input_srid}")
-            
-            # Read CSV to detect geometry columns
-            import csv
-            with open(input_file, 'r') as f:
-                reader = csv.DictReader(f)
-                headers = reader.fieldnames
-                first_row = next(reader, None)
-            
-            # Detect geometry columns
-            x_field = None
-            y_field = None
-            wkt_field = None
-            
-            # Check for WKT field
-            for field in headers:
-                if field.upper() in ['WKT', 'GEOM', 'GEOMETRY']:
-                    wkt_field = field
-                    break
-            
-            # Check for X/Y fields if no WKT
-            if not wkt_field:
-                for field in headers:
-                    if field.lower() in ['longitude', 'lon', 'lng', 'x', 'long', 'easting']:
-                        x_field = field
-                    elif field.lower() in ['latitude', 'lat', 'y', 'northing']:
-                        y_field = field
-            
-            # Create VRT file for CSV
-            vrt_file = Path(str(input_file).replace('.csv', '.vrt'))
-            
-            if wkt_field:
-                # VRT for WKT geometry
-                vrt_content = f'''<OGRVRTDataSource>
-    <OGRVRTLayer name="{Path(input_file).stem}">
-        <SrcDataSource>{input_file}</SrcDataSource>
-        <GeometryType>wkbUnknown</GeometryType>
-        <LayerSRS>{input_srid}</LayerSRS>
-        <GeometryField encoding="WKT" field="{wkt_field}"/>
-    </OGRVRTLayer>
-</OGRVRTDataSource>'''
-            elif x_field and y_field:
-                # VRT for X/Y columns
-                vrt_content = f'''<OGRVRTDataSource>
-    <OGRVRTLayer name="{Path(input_file).stem}">
-        <SrcDataSource>{input_file}</SrcDataSource>
-        <GeometryType>wkbPoint</GeometryType>
-        <LayerSRS>{input_srid}</LayerSRS>
-        <GeometryField encoding="PointFromColumns" x="{x_field}" y="{y_field}"/>
-    </OGRVRTLayer>
-</OGRVRTDataSource>'''
-            else:
-                # No geometry columns found, try default
-                print(f"DEBUG: No obvious geometry columns found, trying defaults")
-                vrt_content = f'''<OGRVRTDataSource>
-    <OGRVRTLayer name="{Path(input_file).stem}">
-        <SrcDataSource>{input_file}</SrcDataSource>
-        <GeometryType>wkbPoint</GeometryType>
-        <LayerSRS>{input_srid}</LayerSRS>
-        <GeometryField encoding="PointFromColumns" x="longitude" y="latitude"/>
-    </OGRVRTLayer>
-</OGRVRTDataSource>'''
-            
-            # Write VRT file
-            with open(vrt_file, 'w') as f:
-                f.write(vrt_content)
-            
-            print(f"DEBUG: Created VRT file: {vrt_file} with SRID: {input_srid}")
-            input_file = str(vrt_file)
+        # Build command
+        cmd = [request.command] + prepared_args
         
-        # Determine output file path
-        output_file = OUTPUT_DIR / f"{job_id}_output"
-        output_file = add_format_extension(output_file, job.output_format)
+        # Execute
+        result = await run_command(cmd, cwd=work_dir)
         
-        # Build ogr2ogr command with skipfailures for multi-layer sources
-        cmd = [
-            "ogr2ogr",
-            "-f", get_driver_name(job.output_format),
-            str(output_file),
-            str(input_file),
-            "-skipfailures"  # Skip layer creation failures
-        ]
+        # Store results
+        job.stdout = result.get("stdout")
+        job.stderr = result.get("stderr")
         
-        # For Parquet output from multi-layer source, process first layer only
-        if job.output_format.lower() in ['parquet', 'geoparquet']:
-            # Get first layer name
-            info_cmd = ["ogrinfo", "-q", str(input_file)]
-            info_result = await asyncio.create_subprocess_exec(
-                *info_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, _ = await info_result.communicate()
+        if result["success"]:
+            # Check for output file
+            if request.output_filename:
+                output_path = work_dir / request.output_filename
+                if output_path.exists():
+                    final_path = OUTPUT_DIR / f"{job_id}_{request.output_filename}"
+                    shutil.move(str(output_path), str(final_path))
+                    job.output_file = str(final_path)
             
-            # Parse first layer name
-            for line in stdout.decode().split('\n'):
-                if ': ' in line and '(' in line:
-                    layer_name = line.split(':')[1].split('(')[0].strip()
-                    if layer_name and not layer_name.startswith('INFO'):
-                        cmd.append(layer_name)  # Add specific layer
-                        print(f"DEBUG: Using layer: {layer_name}")
-                        break
-        
-        # Add options
-        if job.options:
-            # Check if we have s_srs but no t_srs or a_srs
-            if "s_srs" in job.options and "t_srs" not in job.options and "a_srs" not in job.options:
-                # Use a_srs (assign SRS) instead of s_srs when not transforming
-                job.options["a_srs"] = job.options["s_srs"]
-                del job.options["s_srs"]
-                print(f"DEBUG: Using -a_srs instead of -s_srs since no transformation requested")
-            
-            for key, value in job.options.items():
-                if key == "clipsrc" and value.startswith("gs://"):
-                    # Download clip file
-                    clip_file = await download_from_gcs(value)
-                    cmd.extend(["-clipsrc", str(clip_file)])
-                elif key in ["s_srs", "t_srs", "a_srs"]:
-                    # Handle SRID options
-                    cmd.extend([f"-{key}", value])
-                else:
-                    cmd.extend([f"-{key}", value])
-        
-        print(f"DEBUG: Running command: {' '.join(cmd)}")
-        
-        # Execute conversion
-        result = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        stdout, stderr = await result.communicate()
-        
-        print(f"DEBUG: Command stdout: {stdout.decode()}")
-        if stderr:
-            print(f"DEBUG: Command stderr: {stderr.decode()}")
-        
-        if result.returncode != 0:
-            raise Exception(f"ogr2ogr failed: {stderr.decode()}")
-        
-        # Verify output file exists
-        if not output_file.exists():
-            raise Exception(f"Output file was not created: {output_file}")
-        
-        print(f"DEBUG: Output file created: {output_file}, size: {output_file.stat().st_size} bytes")
-        
-        # Handle shapefile output - create a zip with all components
-        if job.output_format.lower() in ['shapefile', 'shp']:
-            zip_path = OUTPUT_DIR / f"{job_id}_shapefile.zip"
-            
-            # Find all related shapefile files
-            base_name = output_file.stem
-            shapefile_extensions = ['.shp', '.dbf', '.shx', '.prj', '.cpg', '.qpj', '.shp.xml']
-            
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                files_added = 0
-                for ext in shapefile_extensions:
-                    component_file = output_file.parent / f"{base_name}{ext}"
-                    if component_file.exists():
-                        zipf.write(component_file, component_file.name)
-                        print(f"DEBUG: Added {component_file.name} to zip")
-                        files_added += 1
-                
-                if files_added == 0:
-                    raise Exception("No shapefile components found to zip")
-            
-            print(f"DEBUG: Created shapefile zip: {zip_path} with {files_added} files")
-            
-            # Upload to GCS if specified
-            if job.output_path and job.output_path.startswith("gs://"):
-                await upload_to_gcs(zip_path, job.output_path)
-                # Remove local files after upload
-                zip_path.unlink()
-                for ext in shapefile_extensions:
-                    component_file = output_file.parent / f"{base_name}{ext}"
-                    if component_file.exists():
-                        component_file.unlink()
-            else:
-                job.output_path = str(zip_path)
+            job.status = JobStatus.COMPLETED
         else:
-            # For non-shapefile formats, handle normally
-            if job.output_path and job.output_path.startswith("gs://"):
-                await upload_to_gcs(output_file, job.output_path)
-                # Remove local file after upload
-                output_file.unlink()
-            else:
-                job.output_path = str(output_file)
-        
-        # Update job status
-        job.status = JobStatus.COMPLETED
-        job.completed_at = datetime.utcnow()
-        print(f"DEBUG: Job {job_id} completed successfully")
+            job.status = JobStatus.FAILED
+            job.error = result.get("error") or "Command failed"
         
     except Exception as e:
-        print(f"DEBUG: Job {job_id} failed with error: {str(e)}")
         job.status = JobStatus.FAILED
         job.error = str(e)
-        job.completed_at = datetime.utcnow()
     
     finally:
-        # Clean up input file if downloaded
-        if job.input_source == "gcs" and Path(input_file).exists():
-            Path(input_file).unlink()
+        job.completed_at = datetime.utcnow()
+        job.execution_time_seconds = (job.completed_at - start_time).total_seconds()
+        
+        # Clean up workspace
+        if work_dir.exists():
+            shutil.rmtree(work_dir)
 
 
-async def download_from_gcs(gcs_url: str) -> Path:
-    """Download file from GCS"""
-    if not gcs_url.startswith("gs://"):
-        raise ValueError("Invalid GCS URL")
+def prepare_arguments(args: List[str], work_dir: Path) -> List[str]:
+    """Prepare command arguments, handling file paths"""
+    prepared = []
     
-    # Parse GCS URL
-    parts = gcs_url[5:].split("/", 1)
-    if len(parts) != 2:
-        raise ValueError("Invalid GCS URL format")
+    for arg in args:
+        # Check if argument looks like a file path
+        if "/" in arg or "\\" in arg or "." in arg:
+            # If it's a relative path, make it absolute within work_dir
+            path = Path(arg)
+            if not path.is_absolute():
+                arg = str(work_dir / arg)
+        
+        prepared.append(arg)
     
-    bucket_name, object_name = parts
-    
-    # Download file
-    local_path = WORKSPACE_DIR / f"{uuid.uuid4()}_{Path(object_name).name}"
-    
-    bucket = gcs_client.bucket(bucket_name)
-    blob = bucket.blob(object_name)
-    blob.download_to_filename(str(local_path))
-    
-    return local_path
+    return prepared
 
 
-async def upload_to_gcs(local_path: Path, gcs_url: str):
-    """Upload file to GCS"""
-    # Parse GCS URL
-    parts = gcs_url[5:].split("/", 1)
-    if len(parts) != 2:
-        raise ValueError("Invalid GCS URL format")
-    
-    bucket_name, object_name = parts
-    
-    # Upload file
-    bucket = gcs_client.bucket(bucket_name)
-    blob = bucket.blob(object_name)
-    blob.upload_from_filename(str(local_path))
-
-
-def get_driver_name(format_name: str) -> str:
-    """Get GDAL driver name from format name"""
-    driver_map = {
-        "shapefile": "ESRI Shapefile",
-        "shp": "ESRI Shapefile",
-        "gpkg": "GPKG",
-        "geopackage": "GPKG",
-        "geojson": "GeoJSON",
-        "json": "GeoJSON",
-        "csv": "CSV",
-        "kml": "KML",
-        "gdb": "OpenFileGDB",
-        "fgb": "FlatGeobuf",
-        "flatgeobuf": "FlatGeobuf",
-        "parquet": "Parquet",
-        "geoparquet": "Parquet",
-        "gml": "GML",
-        "tab": "MapInfo File",
-        "mif": "MapInfo File"
+def get_command_example(command: str) -> str:
+    """Get example usage for a command"""
+    examples = {
+        "ogr2ogr": '["-f", "GeoJSON", "output.json", "input.shp"]',
+        "ogrinfo": '["-al", "-so", "input.shp"]',
+        "gdal_translate": '["-of", "GTiff", "input.jp2", "output.tif"]',
+        "gdalwarp": '["-t_srs", "EPSG:4326", "input.tif", "output.tif"]',
+        "gdalinfo": '["input.tif"]',
+        "gdal_rasterize": '["-a", "ATTRIBUTE", "-ts", "1024", "1024", "input.shp", "output.tif"]',
+        "gdal_polygonize": '["input.tif", "output.shp"]',
+        "gdal_contour": '["-a", "elev", "-i", "10", "input.tif", "output.shp"]',
+        "gdaldem": '["hillshade", "input.tif", "output.tif"]',
+        "ogrmerge": '["-o", "merged.shp", "file1.shp", "file2.shp"]'
     }
-    
-    return driver_map.get(format_name.lower(), format_name)
+    return examples.get(command, "[]")
 
 
-def add_format_extension(path: Path, format_name: str) -> Path:
-    """Add appropriate extension based on format"""
-    ext_map = {
-        "shapefile": ".shp",
-        "shp": ".shp",
-        "gpkg": ".gpkg",
-        "geopackage": ".gpkg",
-        "geojson": ".geojson",
-        "json": ".json",
-        "csv": ".csv",
-        "kml": ".kml",
-        "gdb": ".gdb",
-        "fgb": ".fgb",
-        "flatgeobuf": ".fgb",
-        "parquet": ".parquet",
-        "geoparquet": ".parquet",
-        "gml": ".gml",
-        "tab": ".tab",
-        "mif": ".mif"
-    }
+def cleanup_old_files(hours: int = 24):
+    """Clean up files older than specified hours"""
+    import time
+    current_time = time.time()
     
-    ext = ext_map.get(format_name.lower(), "")
-    return path.with_suffix(ext)
+    for directory in [WORKSPACE_DIR, OUTPUT_DIR, UPLOAD_DIR]:
+        if not directory.exists():
+            continue
+            
+        for filepath in directory.iterdir():
+            if filepath.is_file():
+                file_age_hours = (current_time - filepath.stat().st_mtime) / 3600
+                if file_age_hours > hours:
+                    try:
+                        filepath.unlink()
+                    except Exception:
+                        pass
 
 
 if __name__ == "__main__":
