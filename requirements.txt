@@ -1,6 +1,15 @@
-# requirements.txt
+# requirements.txt - Enhanced with Google Cloud Storage support
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
 python-multipart==0.0.6
 aiofiles==23.2.1
 pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Google Cloud dependencies
+google-cloud-storage==2.13.0
+google-auth==2.25.2
+google-cloud-core==2.4.1
+
+# Additional utilities
+python-dateutil==2.8.2
