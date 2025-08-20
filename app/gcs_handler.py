@@ -1,17 +1,24 @@
-"""Google Cloud Storage integration for GDAL operations"""
+"""
+Simple Google Cloud Storage handler for GDAL operations
+"""
 
 import os
 import re
 import uuid
 import asyncio
-import tempfile
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timedelta
 import logging
 
-from google.cloud import storage
-from google.auth.exceptions import DefaultCredentialsError
+try:
+    from google.cloud import storage
+    from google.auth.exceptions import DefaultCredentialsError
+    GCS_AVAILABLE = True
+except ImportError:
+    GCS_AVAILABLE = False
+    storage = None
+    DefaultCredentialsError = Exception
 
 logger = logging.getLogger(__name__)
 
@@ -27,15 +34,20 @@ class GCSHandler:
             project_id: GCP project ID
             default_bucket: Default bucket for operations
         """
+        if not GCS_AVAILABLE:
+            raise ImportError("Google Cloud Storage dependencies not available")
+        
         self.project_id = project_id or os.getenv("GCP_PROJECT")
         self.default_bucket = default_bucket or os.getenv("GCS_BUCKET")
+        self.client = None
         
         try:
             self.client = storage.Client(project=self.project_id)
             logger.info(f"GCS client initialized for project: {self.project_id}")
         except DefaultCredentialsError:
             logger.warning("No GCS credentials found, GCS operations will fail")
-            self.client = None
+        except Exception as e:
+            logger.error(f"Failed to initialize GCS client: {e}")
     
     def parse_gcs_url(self, gcs_url: str) -> Tuple[str, str]:
         """Parse GCS URL into bucket and object path"""
@@ -95,7 +107,7 @@ class GCSHandler:
         local_path = local_dir / local_filename
         
         try:
-            # Use gsutil for better performance with large files
+            # Try gsutil first for better performance
             cmd = ["gsutil", "-m", "cp", gcs_url, str(local_path)]
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -144,7 +156,7 @@ class GCSHandler:
         bucket_name, object_name = self.parse_gcs_url(gcs_url)
         
         try:
-            # Use gsutil for better performance
+            # Try gsutil first for better performance
             cmd = ["gsutil", "-m", "cp", str(local_path), gcs_url]
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -175,29 +187,6 @@ class GCSHandler:
         # Upload in chunks for large files
         blob.upload_from_filename(str(local_path))
     
-    def get_file_info(self, gcs_url: str) -> Dict:
-        """Get information about a GCS file"""
-        if not self.client:
-            raise RuntimeError("GCS client not initialized")
-        
-        bucket_name, object_name = self.parse_gcs_url(gcs_url)
-        bucket = self.client.bucket(bucket_name)
-        blob = bucket.blob(object_name)
-        
-        if not blob.exists():
-            raise FileNotFoundError(f"File not found: {gcs_url}")
-        
-        blob.reload()
-        
-        return {
-            "name": blob.name,
-            "size": blob.size,
-            "content_type": blob.content_type,
-            "created": blob.time_created,
-            "updated": blob.updated,
-            "etag": blob.etag
-        }
-    
     def list_files(self, bucket_name: str = None, prefix: str = "") -> List[Dict]:
         """List files in bucket with optional prefix"""
         if not self.client:
@@ -221,5 +210,3 @@ class GCSHandler:
             })
         
         return files
-
-

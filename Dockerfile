@@ -50,4 +50,4 @@ ENV CLOUDSDK_METRICS_ENVIRONMENT=container
 EXPOSE 8080
 
 # Run the application using virtual environment's Python
-CMD ["python", "-m", "uvicorn", "app.main_enhanced:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
